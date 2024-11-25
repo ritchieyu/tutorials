@@ -30,9 +30,10 @@ from scripts.utils_plot import find_label_center_loc, get_xyz_plot, show_image
 
 # additional imports
 from pvg.runner.utilities.io import IO
+from pvg.constants.loris.general import Sequences
 
 from dataset import DatasetDescription, CustomDataLoader
-from utils import build_batch
+from utils import MAISI_Transform, define_train_transform, define_val_transform
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -50,13 +51,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data-dir', required=True, help='Parent directory of LORIS dataset (SLURM_TMPDIR)')
 parser.add_argument('--exp', required=True, help='Experiment number, for labelling')
 parser.add_argument('--debug', action='store_true', required=False, help='Whether to deactivate certain aspects of the script for debugging (e.g., Comet logging)')
-parser.add_argument('--device-ids', nargs='+', type=int, required=False, help='Device IDs for Data Parallel')
+parser.add_argument('--device-ids', nargs='+', default=[], type=int, required=False, help='Device IDs for Data Parallel')
+parser.add_argument('--num-splits', required=False, type=int, help='Number of tensor splits')
 pargs = parser.parse_args()
 
 data_dir = pargs.data_dir
 exp = pargs.exp
 debug = pargs.debug
+num_splits = pargs.num_splits
 device_ids = [f'cuda:{gpu}' for gpu in pargs.device_ids]
+
+if len(device_ids) == 1:
+    DEVICE = device_ids[0]
 
 # --------------------
 # Setup data directory
@@ -65,33 +71,6 @@ directory = os.environ.get("MONAI_DATA_DIRECTORY")
 if directory is not None:
     os.makedirs(directory, exist_ok=True)
 root_dir = tempfile.mkdtemp() if directory is None else directory
-
-
-# ------------------------
-# Instantiate data loaders
-# ------------------------
-splits_path = '/home/ritchiey/projects/def-arbeltal/ritchiey/capstone/old_splits.pickle'  # using 1x1x3_v4_0_w000 for now...
-rootdir_dict = {"MRI_AND_LABEL": f"{data_dir}/loris_1x1x3_v4_0_w000"}
-splits = IO.load_pickle(splits_path)
-dataset_descriptor = DatasetDescription()
-dataset_descriptor.setup_datasets(splits["experiment"], rootdir_dict)
-
-dataloader = CustomDataLoader()
-dataloader_train = dataloader.get_train_loader(dataset_descriptor.train_dataset)
-dataloader_val = dataloader.get_val_loader(dataset_descriptor.val_dataset)
-dataloader_test = dataloader.get_test_loader(dataset_descriptor.test_dataset)
-
-
-# --------------------------------
-# Visualize intensity distribution
-# --------------------------------
-img = next(iter(dataloader_train))
-img = build_batch(img, DEVICE)['MRI']
-
-fig, ax = plt.subplots()
-ax.hist(img.detach().cpu().numpy().flatten(), bins=30, log=True)
-
-fig.savefig('intensity.png', dpi=300)
 
 
 # ----------------------------
@@ -133,6 +112,61 @@ for k, v in config_train_dict["autoencoder_train"].items():
 print("Network definition and training hyperparameters have been loaded.")
 
 
+# ------------------------
+# Instantiate data loaders
+# ------------------------
+train_transform = define_train_transform(random_aug=args.random_aug,
+                                         patch_size=args.patch_size,
+                                         output_dtype=torch.float16,  # final data type
+                                         spacing_type=args.spacing_type,
+                                         spacing=args.spacing,
+                                         image_keys=["MRI"],
+                                         label_keys=[],
+                                         additional_keys=[],
+                                         select_channel=0)
+
+
+val_transform = define_val_transform(k=4,  # patches should be divisible by k
+                                     val_patch_size=args.val_patch_size,  # if None, will validate on whole image volume
+                                     output_dtype=torch.float16,  # final data type
+                                     image_keys=["MRI"],
+                                     label_keys=[],
+                                     additional_keys=[],
+                                     select_channel=0)
+
+test_transform = val_transform
+
+splits_path = '/home/ritchiey/projects/def-arbeltal/ritchiey/capstone/old_splits.pickle'  # using 1x1x3_v4_0_w000 for now...
+rootdir_dict = {"MRI_AND_LABEL": f"{data_dir}/loris_1x1x3_v4_0_w000"}
+splits = IO.load_pickle(splits_path)
+dataset_descriptor = DatasetDescription(sequences=[Sequences.FLR])
+dataset_descriptor.setup_datasets(data_split=splits["experiment"],
+                                  rootdir_dict=rootdir_dict,
+                                  train_transform=MAISI_Transform(train_transform),
+                                  val_transform=MAISI_Transform(val_transform),
+                                  test_transform=MAISI_Transform(test_transform))
+
+dataloader = CustomDataLoader(train_batch_size=args.batch_size,
+                              val_batch_size=args.val_batch_size,
+                              test_batch_size=args.val_batch_size,
+                              num_workers=7)
+
+dataloader_train = dataloader.get_train_loader(dataset_descriptor.train_dataset)
+dataloader_val = dataloader.get_val_loader(dataset_descriptor.val_dataset)
+dataloader_test = dataloader.get_test_loader(dataset_descriptor.test_dataset)
+
+
+# --------------------------------
+# Visualize intensity distribution
+# --------------------------------
+img = next(iter(dataloader_train))["MRI"]
+
+fig, ax = plt.subplots()
+ax.hist(img.detach().cpu().numpy().flatten(), bins=30, log=True)
+
+fig.savefig('intensity.png', dpi=300)
+
+
 # -------------------
 # Setup Comet logging
 # -------------------
@@ -156,12 +190,12 @@ set_determinism(seed=0)
 # -------------------
 # Initialize networks
 # -------------------
-args.autoencoder_def["num_splits"] = 1
+args.autoencoder_def["num_splits"] = num_splits
 
 # load pre-trained autoencoder, which we will finetune
 state_dict = torch.load('models/autoencoder_epoch273.pt', map_location='cpu')
 
-if not(device_ids is None):
+if len(device_ids) > 1:
     autoencoder = define_instance(args, "autoencoder_def")
     autoencoder = nn.DataParallel(autoencoder, device_ids=device_ids).cuda()
     autoencoder.module.load_state_dict(state_dict)
@@ -179,7 +213,8 @@ if not(device_ids is None):
 
 else:
     autoencoder = define_instance(args, "autoencoder_def")
-    autoencoder.load_state_dict(state_dict).to(DEVICE)
+    autoencoder.to(DEVICE)
+    autoencoder.load_state_dict(state_dict)
     discriminator_norm = "INSTANCE"
     discriminator = PatchDiscriminator(
         spatial_dims=args.spatial_dims,
@@ -208,7 +243,7 @@ pl = torch.load(pl_path, weights_only=False).eval().to(DEVICE)
 loss_perceptual = (pl)
 
 # config optimizer and lr scheduler
-if not(device_ids is None):
+if len(device_ids) > 1:
     optimizer_g = torch.optim.Adam(params=autoencoder.module.parameters(), lr=args.lr, eps=1e-06 if args.amp else 1e-08)
     optimizer_d = torch.optim.Adam(params=discriminator.module.parameters(), lr=args.lr, eps=1e-06 if args.amp else 1e-08)
 else:
@@ -251,10 +286,10 @@ max_epochs = args.n_epochs
 # Setup validation inferer
 val_inferer = (
     SlidingWindowInferer(
-        roi_size=args.val_sliding_window_patch_size,
+        roi_size=args.val_sliding_window_patch_size,  # If (image volume) >= (roi volume) is , then dynamic_infer calls SlidingWindowInferer. Otherwise, perform standard forward() for inference.
         sw_batch_size=1,
         progress=False,
-        overlap=0.0,
+        overlap=0.0,  # NOTE: INCREASE TOWARDS 1.0 TO REDUCE STITCHING ARTIFACTS
         device=torch.device("cpu"),
         sw_device=DEVICE,
     )
@@ -272,10 +307,10 @@ for epoch in range(start_epoch, max_epochs):
     discriminator.train()
     train_epoch_losses = {"recons_loss": 0, "kl_loss": 0, "p_loss": 0, "g_loss": 0, "d_loss": 0}
 
-    for batch_idx, batch in tqdm(enumerate(dataloader_train)):
+    for batch_idx, batch in tqdm(enumerate(dataloader_train), total=len(dataloader_train)):
 
-        batch = build_batch(batch, DEVICE)  # key step
-        images = batch['MRI'].contiguous()
+        # batch = build_batch(batch, DEVICE)  # key step
+        images = batch['MRI'].contiguous().to(DEVICE)
 
         optimizer_g.zero_grad(set_to_none=True)
         optimizer_d.zero_grad(set_to_none=True)
@@ -283,6 +318,7 @@ for epoch in range(start_epoch, max_epochs):
             
             # Train Generator
             reconstruction, z_mu, z_sigma = autoencoder(images)
+            # print(z_mu.shape, z_sigma.shape)
             losses = {
                 "recons_loss": intensity_loss(reconstruction, images),
                 "kl_loss": KL_loss(z_mu, z_sigma),
@@ -319,13 +355,20 @@ for epoch in range(start_epoch, max_epochs):
             losses['g_loss'] = loss_g.detach().cpu()
             losses['d_loss'] = loss_d.detach().cpu()
 
-        # Log sample reconstruction (since training proceeds so slowly, sub-sample an epoch)
-        if batch_idx % 100 == 0 and not(debug):
+        # Log sample reconstruction
+        if batch_idx == 0 and not(debug):
             for i in range(reconstruction.shape[0]):
-                fig, ax = plt.subplots()
+                fig, ax = plt.subplots(1, 2)
                 fig.dpi = 500
-                img_slice = reconstruction[i, 0, 32, :, :].detach().cpu().numpy()
-                ax.imshow(img_slice, cmap='gray')
+
+                img_slice = images[i, 0, 32, :, :].detach().cpu().numpy()
+                rec_slice = reconstruction[i, 0, 32, :, :].detach().cpu().numpy()
+
+                ax[0].imshow(img_slice, cmap='gray')
+                ax[1].imshow(rec_slice, cmap='gray')
+                ax[0].set_title("Original")
+                ax[1].set_title("Reconstruction")
+                
                 comet_experiment.log_figure(f"Train {i}/{reconstruction.shape[0]}", fig)
 
         # Log training loss
@@ -338,11 +381,12 @@ for epoch in range(start_epoch, max_epochs):
     scheduler_d.step()
 
     # Compute average validation loss
-    for key in train_epoch_losses:
+    for key in train_epoch_losses.keys():
         train_epoch_losses[key] /= len(dataloader_train)
 
     # Log losses to Comet
     if not(debug):
+        loss_log = {f"train_{k}":v for k,v in train_epoch_losses.items()}
         comet_experiment.log_metrics(train_epoch_losses)
 
     print(f"Epoch {epoch} train_vae_loss {loss_weighted_sum(train_epoch_losses)}: {train_epoch_losses}.")
@@ -356,12 +400,15 @@ for epoch in range(start_epoch, max_epochs):
         autoencoder.eval()
         val_epoch_losses = {"recons_loss": 0, "kl_loss": 0, "p_loss": 0}
         val_loader_iter = iter(dataloader_val)
-        for batch_idx, batch in tqdm(enumerate(dataloader_val)):
+
+        num_samples = 10
+
+        for batch_idx, batch in tqdm(enumerate(dataloader_val), total=len(dataloader_val)):
             with torch.no_grad():
                 with autocast("cuda", enabled=args.amp):
                     
-                    batch = build_batch(batch, 'cpu')  # key step
-                    images = batch["MRI"]
+                    # batch = build_batch(batch, 'cpu')  # key step
+                    images = batch["MRI"].to("cpu")
 
                     reconstruction, _, _ = dynamic_infer(val_inferer, autoencoder, images)
                     reconstruction = reconstruction.to(DEVICE)
@@ -370,21 +417,28 @@ for epoch in range(start_epoch, max_epochs):
                     val_epoch_losses["p_loss"] += loss_perceptual(reconstruction, images.to(DEVICE)).item()
             
             # Log sample reconstruction (since validation proceeds so slowly, sub-sample an epoch)
-            if batch_idx % 100 == 0 and not(debug):
-                for i in range(reconstruction.shape[0]):
-                    fig, ax = plt.subplots()
-                    fig.dpi = 500
-                    img_slice = reconstruction[i, 0, 32, :, :].detach().cpu().numpy()
-                    ax.imshow(img_slice, cmap='gray')
-                    comet_experiment.log_figure(f"Validation {i}/{reconstruction.shape[0]}", fig)
+            if batch_idx <= num_samples and not(debug):
+                fig, ax = plt.subplots(1, 2)
+                fig.dpi = 500
+
+                img_slice = images[0, 0, 32, :, :].detach().cpu().numpy()
+                rec_slice = reconstruction[0, 0, 32, :, :].detach().cpu().numpy()
+
+                ax[0].imshow(img_slice, cmap='gray')
+                ax[1].imshow(rec_slice, cmap='gray')
+                ax[0].set_title("Original")
+                ax[1].set_title("Reconstruction")
+                
+                comet_experiment.log_figure(f"Validation {batch_idx}/{num_samples}", fig)
 
         # Compute average validation loss
-        for key in val_epoch_losses:
+        for key in val_epoch_losses.keys():
             val_epoch_losses[key] /= len(dataloader_val)
 
         # Log losses
         if not(debug):
-            comet_experiment.log_metrics(val_epoch_losses)
+            loss_log = {f"val_{k}":v for k,v in val_epoch_losses.items()}
+            comet_experiment.log_metrics(loss_log)
 
         val_loss_g = loss_weighted_sum(val_epoch_losses)
         print(f"Epoch {epoch} val_vae_loss {val_loss_g}: {val_epoch_losses}.")
@@ -400,10 +454,10 @@ for epoch in range(start_epoch, max_epochs):
         # We'd like to tune kl_weights in order to make scale_factor close to 1.
         scale_factor_sample = 1.0 / z_mu.flatten().std()
 
-        # Monitor reconstruction result
-        center_loc_axis = find_label_center_loc(images[0, 0, ...])
-        vis_image = get_xyz_plot(images[0, ...], center_loc_axis, mask_bool=False)
-        vis_recon_image = get_xyz_plot(reconstruction[0, ...], center_loc_axis, mask_bool=False)
+        # # Monitor reconstruction result
+        # center_loc_axis = find_label_center_loc(images[0, 0, ...])
+        # vis_image = get_xyz_plot(images[0, ...], center_loc_axis, mask_bool=False)
+        # vis_recon_image = get_xyz_plot(reconstruction[0, ...], center_loc_axis, mask_bool=False)
 
-        show_image(vis_image, title="val image")
-        show_image(vis_recon_image, title="val recon result")
+        # show_image(vis_image, title="val image")
+        # show_image(vis_recon_image, title="val recon result")
